@@ -12,14 +12,11 @@ import matplotlib.pyplot as plt
 
 
 from env_hiv import HIVPatient
-#from fast_env_py import FastHIVPatient
-
 from evaluate import evaluate_HIV, evaluate_HIV_population
 
 
 env = TimeLimit(
-    #env=FastHIVPatient(domain_randomization=True), max_episode_steps=200
-    env=HIVPatient(domain_randomization=True), max_episode_steps=200
+    env=HIVPatient(domain_randomization=True), max_episode_steps=350
 )  # The time wrapper limits the number of steps in an episode at 200.
 # Now is the floor is yours to implement the agent and train it.
 
@@ -31,6 +28,8 @@ env = TimeLimit(
 ###############################################################################
 # We implement a DQN
 
+
+
 class ProjectAgent:
     def act(self, observation, use_random=False):
         device = "cuda" if next(self.model.parameters()).is_cuda else "cpu"
@@ -39,13 +38,13 @@ class ProjectAgent:
             return torch.argmax(Q).item()
 
     def save(self, path):
-        self.path = path + "/model.pt"
+        self.path = path + "/model_v3.pt"
         torch.save(self.model.state_dict(), self.path)
         return 
 
     def load(self):
         device = torch.device('cpu')
-        self.path = os.getcwd() + "/model.pt"
+        self.path = os.getcwd() + "/model_v3.pt"
         self.model = self.myDQN({}, device)
         self.model.load_state_dict(torch.load(self.path, map_location=device))
         self.model.eval()
@@ -68,61 +67,80 @@ class ProjectAgent:
             loss = self.criterion(QXA, update.unsqueeze(1))
             self.optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step() 
 
-    # DQN (ideas for later: double DQN? more layers? test dropout)
     def myDQN(self, config, device):
-
         state_dim = env.observation_space.shape[0]
-        n_action = env.action_space.n # .n returns the number of possible actions
-        nb_neurons=256 # Power of 2 works better
+        n_action = env.action_space.n  # Number of possible actions
+        nb_neurons = 256  # Hidden layer size
 
-        # Possible to define it as usual (as a class, not sequential)
-        dropout_prob = 0.2  # Common values are 0.2, 0.3, or 0.5, adjust as needed
+        # Define the dueling DQN model
+        class DuelingDQN(nn.Module):
+            def __init__(self, state_dim, n_action, nb_neurons):
+                super(DuelingDQN, self).__init__()
+                # Shared layers
+                dropout_prob = 0.2
+                self.feature = nn.Sequential(
+                    nn.Linear(state_dim, nb_neurons),
+                    nn.LeakyReLU(negative_slope=0.01),
+                    nn.Linear(nb_neurons, nb_neurons),
+                    nn.LeakyReLU(negative_slope=0.01),
+                    nn.Linear(nb_neurons, nb_neurons),
+                    nn.LeakyReLU(negative_slope=0.01),
+                )
+                # Value stream
+                self.value = nn.Sequential(
+                    nn.Dropout(p=dropout_prob),
+                    #nn.Linear(nb_neurons, nb_neurons),
+                    #nn.LeakyReLU(negative_slope=0.01),
+                    nn.Linear(nb_neurons, nb_neurons),
+                    nn.LeakyReLU(negative_slope=0.01),
+                    nn.Linear(nb_neurons, 1)  # Output a single value V(s)
+                )
+                # Advantage stream
+                self.advantage = nn.Sequential(
+                    nn.Dropout(p=dropout_prob),
+                    #nn.Linear(nb_neurons, nb_neurons),
+                    #nn.LeakyReLU(negative_slope=0.01),
+                    #nn.Linear(nb_neurons, nb_neurons),
+                    #nn.LeakyReLU(negative_slope=0.01),
+                    nn.Linear(nb_neurons, nb_neurons),
+                    nn.LeakyReLU(negative_slope=0.01),
+                    nn.Linear(nb_neurons, n_action)  # Output advantages for all actions A(s, a)
+                )
 
-        DQN = torch.nn.Sequential(
-            nn.Linear(state_dim, nb_neurons),
-            nn.ReLU(),
-            #nn.Dropout(p=dropout_prob),
-            
-            nn.Linear(nb_neurons, nb_neurons),
-            #nn.LayerNorm(nb_neurons),  # BatchNorm after Linear
-            nn.LeakyReLU(negative_slope=0.01),
-            #nn.Dropout(p=dropout_prob),
-            
-            nn.Linear(nb_neurons, nb_neurons),
-            #nn.LayerNorm(nb_neurons),
-            nn.LeakyReLU(negative_slope=0.01),
-            #nn.Dropout(p=dropout_prob),
-            
-            nn.Linear(nb_neurons, nb_neurons),
-            #nn.LayerNorm(nb_neurons),
-            nn.LeakyReLU(negative_slope=0.01),
-            
-            nn.Linear(nb_neurons, nb_neurons),
-            #nn.LayerNorm(nb_neurons),
-            nn.LeakyReLU(negative_slope=0.01),
-            
-            nn.Linear(nb_neurons, n_action)
-        ).to(device)
+                self.residual = nn.Linear(state_dim, nb_neurons)
 
-        return DQN
+            def forward(self, x):
+                residual = self.residual(x)
+                features = self.feature(x) + residual
+                value = self.value(features)
+                advantage = self.advantage(features)
+                # Combine streams to compute Q-values
+                q_values = value + (advantage - advantage.mean(dim=1, keepdim=True))
+                return q_values
+
+        # Instantiate the model and move it to the device
+        model = DuelingDQN(state_dim, n_action, nb_neurons).to(device)
+        return model
+
 
     def train(self):
 
         config = {'nb_actions': env.action_space.n,
-                'learning_rate': 0.001,
+                'learning_rate': 0.00005,
                 'gamma': 0.98,
-                'buffer_size': 100000,
+                'buffer_size': 1000000,
                 'epsilon_min': 0.05,
                 'epsilon_max': 1.,
-                'epsilon_decay_period': 25000, 
+                'epsilon_decay_period': 21000, 
                 'epsilon_delay_decay': 300,
                 'batch_size': 790,
-                'gradient_steps': 3,
-                'update_target_strategy': 'replace', # or 'ema' (tried but replace seems to work better for this model/problem)
+                'gradient_steps': 1,
+                'update_target_strategy': 'ema', # or 'ema' (tried but replace seems to work better for this model/problem)
                 'update_target_freq': 400,
-                'update_target_tau': 0.005,
+                'update_target_tau': 0.001,
                 'criterion': torch.nn.SmoothL1Loss()}
 
     
@@ -186,7 +204,7 @@ class ProjectAgent:
             self.memory.append(state, action, reward, next_state, done)
             episode_cum_reward += reward
             
-            for _ in range(nb_gradient_steps): 
+            for _ in range(nb_gradient_steps + (episode > 100)): 
                 self.gradient_step()
 
             if update_target_strategy == 'replace': 
@@ -212,13 +230,6 @@ class ProjectAgent:
                       f"Episode Return {episode_cum_reward:.2e} | "
                       f"Evaluation Score {validation_score:.2e}")
                 state, _ = env.reset()
-
-                if validation_score > 1e9 and previous_val > 1e9:
-                    self.best_model = deepcopy(self.model).to(device)
-                    path = os.getcwd()
-                    self.save(path)
-                    print("We stop here as we have reached a very good performance.")
-                    return episode_return
 
                 if validation_score > previous_val:
                     previous_val = validation_score
